@@ -114,7 +114,7 @@ No additional libraries are required.
 Clone the repository:
 
 ```bash
-git clone https://github.com/yourname/irc-learning-bot
+git clone https://github.com/hakbr/IRC-AI-bot
 cd irc-learning-bot
 ```
 
