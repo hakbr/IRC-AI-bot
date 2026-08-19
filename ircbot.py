@@ -34,13 +34,22 @@ MEME_FILE = "memes.json"
 
 MAX_MEMORY = 30
 REPLY_COOLDOWN = 30
-RANDOM_REPLY_CHANCE = 0.05
+RANDOM_REPLY_CHANCE = 0.03
 MIN_MESSAGES_BEFORE_TALK = 20
 
 AUTOSAVE_INTERVAL = 50
 
 VECTOR_SIZE = 64
 ANN_BUCKETS = 32
+
+# how "picky" the veteran persona is about jumping into a thread.
+# even for a technical question, only answer this fraction of the time -
+# a real veteran doesn't answer every question thrown in the channel.
+CREDIBLE_ANSWER_CHANCE = 0.35
+
+# if anyone says the word "bot" (in any form), go quiet for this long.
+BOT_MENTION_COOLDOWN_SECONDS = 12 * 60 * 60  # 12 hours
+BOT_TRIGGER_WORDS = {"bot", "bots", "botted", "botting"}
 
 # ---------------- STATE ----------------
 
@@ -64,27 +73,39 @@ LAST_MESSAGES = {}
 MESSAGES_SEEN = 0
 LAST_REPLY = 0
 
+# timestamp (epoch seconds) until which the bot will not reply at all,
+# because someone mentioned "bot" in the channel.
+BOT_MENTION_COOLDOWN_UNTIL = 0
+
 # ---------------- PERSONA ----------------
 
 SYSTEM_PERSONA = """
 you are hallvor
 
 29 year old norwegian
-devops / linux nerd
+linux veteran - been running linux since the early 2000s
+devops / sysadmin by trade
 daily driver debian stable
-runs raspberry pi servers
+runs raspberry pi servers, some alpine boxes too
+seen every init system, every package manager, every filesystem drama
 
 personality:
 casual irc user
 lowercase
-short replies
+short replies, terse, no hand-holding
 dry humor
 mild sarcasm
+doesn't repeat what's obvious or already answered
+only chimes in when you actually have something to add - not every question
+needs your input, and you don't answer stuff that's trivially googleable
+or already covered by `man` / `--help`
+if something is basic, you'd rather say nothing than state the obvious
 
 sometimes says:
 lol
 rip
 skill issue
+rtfm (rarely, only when it's deserved)
 
 never mention being an ai
 """
@@ -353,6 +374,86 @@ def is_spam(sender, msg):
 
     return False
 
+# ---------------- BOT-MENTION COOLDOWN ----------------
+
+def check_bot_mention(msg):
+    """
+    If anyone mentions the word "bot" (or a close variant), go silent for
+    BOT_MENTION_COOLDOWN_SECONDS. This is checked on every message, even
+    ones we wouldn't otherwise reply to, and regardless of who said it.
+    """
+
+    global BOT_MENTION_COOLDOWN_UNTIL
+
+    words = set(re.findall(r"[a-z0-9]+", msg.lower()))
+
+    if words & BOT_TRIGGER_WORDS:
+
+        BOT_MENTION_COOLDOWN_UNTIL = time.time() + BOT_MENTION_COOLDOWN_SECONDS
+
+        print(f"'bot' mentioned -> cooling down until "
+              f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(BOT_MENTION_COOLDOWN_UNTIL))}")
+
+
+def in_bot_mention_cooldown():
+
+    return time.time() < BOT_MENTION_COOLDOWN_UNTIL
+
+# ---------------- VETERAN FILTER (skip trivial questions) ----------------
+
+TRIVIAL_WORDS = {
+    "hi", "hello", "hey", "yo", "sup", "gm", "gn", "brb", "afk",
+    "thanks", "thank", "ty", "np", "lol", "lmao", "rofl", "ok", "okay",
+    "nice", "cool", "cya", "bye", "gg", "welcome", "hru", "wyd", "wassup",
+}
+
+# rough signal for "this is a real technical question worth a veteran's time"
+TECH_KEYWORDS = {
+    "kernel", "linux", "debian", "alpine", "arch", "gentoo", "ubuntu",
+    "systemd", "openrc", "runit", "initramfs", "dmesg", "syslog", "klogd",
+    "docker", "container", "podman", "kubernetes", "k8s", "ssh", "bash",
+    "shell", "zsh", "package", "apt", "apk", "pacman", "dpkg", "rpm",
+    "grub", "syslinux", "bootloader", "raid", "zfs", "btrfs", "ext4",
+    "xfs", "lvm", "network", "wifi", "firewall", "iptables", "nftables",
+    "cron", "service", "daemon", "python", "script", "git", "compile",
+    "build", "gcc", "clang", "make", "cmake", "config", "permission",
+    "chmod", "chown", "sudo", "root", "partition", "mount", "fstab",
+    "dns", "tcp", "udp", "port", "proxy", "vpn", "raspberry", "rpi",
+    "arm", "cpu", "memory", "ram", "disk", "filesystem", "log", "logs",
+    "process", "kill", "systemctl", "rc-update", "openssl", "tls", "ssl",
+    "cert", "key", "hardware", "driver", "module", "usb", "pci", "nvme",
+    "swap", "cgroup", "namespace", "syscall", "strace", "ltrace", "gdb",
+    "udev", "dbus", "cron", "crontab", "nfs", "samba", "iommu", "grub2",
+}
+
+
+def is_trivial(msg):
+    """
+    True for greetings/small-talk/one-word noise - the kind of stuff a
+    veteran wouldn't bother responding to even if directly pinged.
+    """
+
+    words = re.findall(r"[a-z0-9']+", msg.lower())
+
+    if not words:
+        return True
+
+    if all(w in TRIVIAL_WORDS for w in words):
+        return True
+
+    # very short, non-technical utterances ("what?", "why", "huh") -> trivial
+    if len(words) <= 3 and not any(w in TECH_KEYWORDS for w in words):
+        return True
+
+    return False
+
+
+def has_technical_substance(msg):
+
+    words = re.findall(r"[a-z0-9']+", msg.lower())
+
+    return any(w in TECH_KEYWORDS for w in words)
+
 # ---------------- LLM ----------------
 
 def ask_llm(prompt):
@@ -477,15 +578,39 @@ def log_message(sender, msg):
     except:
         pass
 
-# ---------------- REPLY ----------------
+# ---------------- REPLY DECISION ----------------
 
 def should_reply(msg):
+    """
+    Veteran-style gatekeeping:
+      - never reply during a bot-mention cooldown
+      - never reply to trivial / small-talk messages
+      - direct pings only get answered if there's real technical content
+      - questions only get answered some of the time (CREDIBLE_ANSWER_CHANCE),
+        and only if they're technical - a veteran doesn't answer everything
+      - otherwise, rarely chime in unprompted, and only on technical talk
+    """
 
-    if NICK.lower() in msg.lower():
-        return True
+    if in_bot_mention_cooldown():
+        return False
 
-    if msg.endswith("?"):
-        return True
+    if is_trivial(msg):
+        return False
+
+    technical = has_technical_substance(msg)
+
+    if not technical:
+        return False
+
+    direct_mention = NICK.lower() in msg.lower()
+    is_question = msg.strip().endswith("?")
+
+    if direct_mention:
+        # even when pinged directly, skip it if it's not a real question
+        return is_question or technical
+
+    if is_question:
+        return random.random() < CREDIBLE_ANSWER_CHANCE
 
     if random.random() < RANDOM_REPLY_CHANCE:
         return True
@@ -524,6 +649,10 @@ def handle_line(line):
         if is_spam(sender, msg):
             return
 
+        # always check for "bot" mentions, even below the reply threshold
+        # and even during an existing cooldown (extends/refreshes it).
+        check_bot_mention(msg)
+
         MESSAGES_SEEN += 1
 
         log_message(sender, msg)
@@ -544,6 +673,9 @@ def handle_line(line):
             save_data()
 
         if MESSAGES_SEEN < MIN_MESSAGES_BEFORE_TALK:
+            return
+
+        if in_bot_mention_cooldown():
             return
 
         if time.time() - LAST_REPLY < REPLY_COOLDOWN:
